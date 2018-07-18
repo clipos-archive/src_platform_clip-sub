@@ -1,0 +1,99 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP configuration import functions.
+# Copyright (C) 2006-2009 SGDN/DCSSI
+# Copyright (C) 2009-2010 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved.
+
+_IMPORT_FILTER_ADDR="[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"
+_IMPORT_FILTER_MASK="[0-9]{1,2}"
+
+if [[ -n "${IMPORT_SUB_DEBUG}" ]]; then
+	set -x 
+fi
+
+import_warn() {
+	echo "${1}" >&2
+	logger -p local0.err -t "[IMPORT]" "${1}"
+}
+
+import_error() {
+	import_warn "${1}"
+	exit 1
+}
+
+skip_comments() {
+	sed -e 's/#.*$//' $* | \
+	grep -Ev '^[[:space:]]*$'
+}
+
+_import_conf() {
+	local err="${1}"
+	local conf_file="${2}"
+	local filter_exp="${3}"
+	local tmpvar=""
+
+	shift 3;
+	for var in $*; do
+		tmpvar="$(cat "${conf_file}" | skip_comments | grep "^$var=" | tail -n 1)"
+		tmpvar="${tmpvar#$var=}"
+		if [[ "${filter_exp}" != "-" ]] ; then
+			tmpvar="$(echo "${tmpvar}" | grep -oEe "${filter_exp}" | head -n 1)"
+		fi
+		if [[ -z "${tmpvar}" ]]; then
+			[[ ${err} -eq 0 ]] && continue
+			return 1
+		fi
+		eval "${var}"='${tmpvar}'
+	done
+}
+
+import_conf() {
+	_import_conf "1" "${@}" || \
+		import_error "Could not import ${var}"
+}
+
+import_conf_noerr() {
+	if ! _import_conf "1" "${@}" ; then
+		import_warn "Could not import ${var}"
+		return 1
+	else
+		return 0
+	fi
+}
+
+import_conf_all() {
+	_import_conf "0" "${@}" 
+}
+
+unimport_conf() {
+	for var in $*; do
+		unset "${var}"
+	done
+}	
+
+_filter_conf() {
+	local filter_exp="${1}"
+	local var="${2}"
+
+	local tmpvar="$(eval echo \${${var}} | sed -e "${filter_exp}")"
+	if [[ -n "${tmpvar}" ]]; then
+		eval "${var}"='-'
+	else 
+		eval "${var}"='${tmpvar}'
+	fi
+}
+
+filter_conf() {
+	_filter_conf "${1}" "${2}"
+}
+
+filter_conf_all() {
+	local filter_exp="${1}"
+	shift
+	for var in "${@}" ; do
+		_filter_conf "${filter_exp}" "${var}"
+	done
+}

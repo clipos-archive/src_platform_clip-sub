@@ -1,0 +1,29 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP Netfilter miscellaneous functions
+
+# Pass IKE UDP to / from peer, with optionnal peer address
+# Note: no stateful : inputs and outputs are expected both
+# on initiator and responder, because of DPD / NAT keepalive
+# Note: The initiator port can be random (as per Section 2.11 of RFC4306)
+# Note: This is the responder variant of this function
+# Args: <interface> <local address> <remote address> <port>
+#
+_pass_ike() {
+	local itf="${1}"
+	local addr="${2}"
+	local port="${3}"
+	local rmtout="${4}"
+	local rmtin="${5}"
+
+	netfilter_cmd -A OUTPUT -o "${itf}" -p udp -s "${addr}" ${rmtout} 	\
+			--sport "${port}" --dport "${ALL_PORTS}"                \
+			-j ACCEPT						\
+		|| return 1
+
+	netfilter_cmd -A INPUT -i "${itf}" -p udp -d "${addr}" ${rmtin}	\
+			--dport "${port}" --sport "${ALL_PORTS}"                \
+			-j ACCEPT					\
+		|| return 1
+}

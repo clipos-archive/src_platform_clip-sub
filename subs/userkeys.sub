@@ -1,0 +1,298 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP user partitions encryption / decryption functions.
+# Copyright (C) 2006-2009 SGDN/DCSSI
+# Copyright (C) 2009-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved.
+
+TCB_BASE="/etc/tcb"
+SALT_LEN="22"
+FULL_LEN="29" # 22 + 7 for settings ('$XX$YY$' with XX=2a and YY=nbr rounds
+MAX_ROUNDS=31 # Max rounds number for bcrypt
+MIN_ROUNDS=8
+DEFAULT_ROUNDS=12
+RANDOM_DEVICE="/dev/urandom"
+LOGIN_DEFS="/etc/login.defs"
+VALID_CHARS="a-zA-Z0-9./" # valid characters for a base64-encoded stream
+STAGE2_ALGO="aes-256-cbc"
+STAGE2_MD_ALGO="sha256"
+
+function _warn() {
+	if [[ -n "${USERKEYS_LOG_FACILITY}" ]]; then
+		logger -p "${USERKEYS_LOG_FACILITY}.warn" "${1}"
+	else
+		echo "${1}" >&2
+	fi
+}
+
+# check the length of an input against that expected for a salt
+# ARGS: <salt to check> (<optionnal len to check - default SALT_LEN>)
+
+function _check_len() {
+	local len="${#1}"
+	local checklen="${2:-${SALT_LEN}}"
+	
+	[[ ${len} -eq ${checklen} ]]
+}
+
+# Read salt off the random device, filtered to keep only valid characters
+# for a base64 encoded stream.
+# ARGS: none
+
+function _read_salt() {
+	local salt="$(tr -cd "${VALID_CHARS}" < "${RANDOM_DEVICE}" \
+						| head -c ${SALT_LEN})"
+	_check_len "${salt}" || return 1
+
+	echo -n "${salt}"
+}
+	
+# Check if two inputs are 'different enough'.
+# Different enough for now means different on a byte per byte basis.
+# This does not detect shifted inputs...
+# ARGS: <old salt> <new salt> (both 22 chars base64)
+
+function _check_diff() {
+	local old="${1}"
+	local new="${2}"
+	_check_len "${old}" || return 1
+	_check_len "${new}" || return 1
+
+	[[ "${old:0:8}" != "${new:0:8}" ]] || return 1
+	[[ "${old:8:8}" != "${new:8:8}" ]] || return 1
+	[[ "${old:16}" != "${new:16}" ]] || return 1
+
+	return 0
+}
+
+# Get a new salt, different from the one passed as input
+# ARGS: <old salt (22 chars, base64) >
+
+function _gen_salt() {
+	local old="${1}"
+	_check_len "${old}" || return 1
+
+	local salt="$(_read_salt)"
+	[[ $? -ne 0 ]] && return 1
+
+	while ! _check_diff "${old}" "${salt}"; do
+		salt="$(_read_salt)"
+		[[ $? -eq 0 ]] || return 1
+	done
+
+	echo -n "${salt}"
+}
+
+# Output a first stage key, i.e. bcrypt-hashed user password
+# The user's password is expected in an environment variable, the name of
+# which is passed as second arg.
+# ARGS: <path to the saved setting> <name of variable holding user's password>
+
+function output_stage1_key() {
+	local setfile="${1}"
+	local passvar="${2}" 
+	if [[ -z "${passvar}" ]] ; then
+		_warn "output_stage1_key: not enough arguments"
+		return 1
+	fi
+
+	local settings="$(cat "${setfile}")"
+	if ! _check_len "${settings}" "${FULL_LEN}"; then
+		_warn "settings read from ${setfile} have an incorrect length"
+		return 1
+	fi
+
+	local key
+	key="$(cryptpasswd --settings "${settings}" --passvar "${passvar}")"
+	if [[ $? -ne 0  || -z "${key}" ]] ; then
+		_warn "Could not hash ${passvar} with ${setfile}"
+		return 1
+	fi
+
+	# skip salt and settings
+	echo -n "${key:${FULL_LEN}}"
+}
+
+# Output a second stage key, by decrypting an input with the first stage key
+# ARGS: <path to setting> <name of password variable> 
+#         <path to encrypted second stage key>
+
+function output_stage2_key() {
+	local setfile="${1}"
+	local passvar="${2}" 
+	local keyfile="${3}"
+	local stage1_key key
+	if [[ -z "${keyfile}" ]] ; then
+		_warn "output_stage2_key: not enough arguments"
+		return 1
+	fi
+
+	stage1_key="$(output_stage1_key "${setfile}" "${passvar}")"
+	[[ $? -eq 0 ]] || return 1
+
+	key="$(PASSVAR="${stage1_key}" openssl ${STAGE2_ALGO} -d \
+					-md ${STAGE2_MD_ALGO} -salt \
+					-in "${keyfile}" -pass env:PASSVAR)"
+	if [[ $? -ne 0  || -z "${key}" ]]; then
+		_warn "output_stage2_key: openssl call failed"
+		return 1
+	fi
+	echo -n "${key}"
+}
+
+# Encrypt a second stage key with the first stage key derived from a settings
+# file and a user password (if passtype = "pw") or directly with the user 
+# password (if passtype = "key"). In other words, in the latter case, the
+# password is interpreted as a symetric encryption key ; this is used with 
+# smartcards, where the stage_1_key corresponds to a master key that is
+# decrypted by the smartcard).
+# ARGS: <path to setting> <name of password variable> 
+#		<path to encrypted second stage key>
+#		<"pw" or "key">
+
+function encrypt_stage2_key() {
+	local setfile="${1}"
+	local passvar="${2}" 
+	local keyfile="${3}"
+	local passtype="${4}"
+
+	local stage1_key
+	if [[ -z "${passtype}" ]] ; then
+		_warn "encrypt_stage2_key: not enough arguments"
+		return 1
+	fi
+
+	local mask=$(umask 077)
+	if [[ ${passtype} == "pw" ]] ; then
+		stage1_key="$(output_stage1_key "${setfile}" "${passvar}")"
+		[[ $? -eq 0 ]] || return 1
+
+		PASSVAR="${stage1_key}" openssl ${STAGE2_ALGO} \
+				-md ${STAGE2_MD_ALGO} -salt \
+				-out "${keyfile}" -pass env:PASSVAR
+	else
+		openssl ${STAGE2_ALGO} \
+				-md ${STAGE2_MD_ALGO} -salt \
+				-out "${keyfile}" -pass env:${passvar}
+	fi
+
+	if [[ $? -ne 0 ]]; then
+		_warn "encrypt_stage2_key: openssl call failed"
+		umask ${mask} >/dev/null
+		return 1
+	fi
+
+	umask ${mask} >/dev/null
+	return 0
+}
+
+# Output a new salt, based on the shadow entry of a user
+# ARGS: <username> <path to output file>
+
+function create_settings() {
+	local user="${1}"
+	local output="${2}"
+	local shadow newsalt
+
+	if [[ -z "${output}" ]] ; then
+		_warn "create_settings: not enough arguments"
+		return 1
+	fi
+
+	shadow="$(awk -F':' '{print $2}' "${TCB_BASE}/${user}/shadow")"
+	if [[ $? -ne 0 || -z "${shadow}" ]]; then
+		_warn "create_settings: could not find shadow entry for ${user}"
+		return 1
+	fi
+	local pref="${shadow:0:7}"
+	local oldsalt="${shadow:7:22}"
+
+	newsalt="$(_gen_salt "${oldsalt}")"
+	if [[ $? -ne 0 || -z "${newsalt}" ]]; then
+		_warn "create_settings: could not generate salt"
+		return 1
+	fi
+
+	local mask="$(umask 077)"
+	if ! mkdir -p "$(dirname "${output}")"; then
+		_warn "create_settings: could not create dir for ${output}"
+		umask ${mask} > /dev/null
+		return 1
+	fi
+
+	if ! echo -n "${pref}${newsalt}" > "${output}" ; then
+		_warn "create_settings: could not output to ${output}"
+		umask ${mask} > /dev/null
+		return 1
+	fi
+
+	umask ${mask} > /dev/null
+}
+
+# Get the 'CRYPT_ROUNDS field from /etc/login.defs
+# ARGS: none
+
+function get_rounds_count() {
+	local rounds="$(awk '$1 ~ /^CRYPT_ROUNDS$/ {print $2 }' "${LOGIN_DEFS}")"
+	[[ $? -eq 0 ]] || return 1
+	[[ ${rounds} -le ${MAX_ROUNDS} ]] || return 1
+	[[ ${rounds} -ge ${MIN_ROUNDS} ]] || return 1
+
+	echo -n "${rounds}"
+}
+
+# Encrypt a password passed through the environment
+# ARGS: <name of the password variable>
+
+function hash_password() {
+	local passvar="${1}"
+	local rounds pass
+	if [[ -z "${passvar}" ]]; then
+		_warn "encrypt_password: not enough arguments"
+		return 1
+	fi
+
+	rounds="$(get_rounds_count)"
+	if [[ $? -ne 0 ]]; then
+		_warn "encrypt_password: could not get CRYPT_ROUNDS,
+							using default"
+		rounds="${DEFAULT_ROUNDS}"
+	fi
+
+	pass="$(cryptpasswd --rounds "${rounds}" \
+						--passvar "${passvar}")"
+	if [[ $? -ne 0 || -z "${pass}" ]]; then
+		_warn "encrypt_password: encryption failed"
+		return 1
+	fi
+
+	echo -n "${pass}"
+}
+
+
+# Decrypt a key file using the master key that has been decrypted by 
+# a smartcard
+# ARGS: <path to file to decrypt>
+
+function p11_master_decrypt_key() {
+	local keyfile="${1}"
+	local key
+
+	if [[ -z "${MASTERKEY}" ]] ; then
+	    _warn "p11_master_decrypt_key: master key empty"
+	    return 1
+	fi
+
+	key="$(PASSVAR="${MASTERKEY}" openssl ${STAGE2_ALGO} -d \
+			-md ${STAGE2_MD_ALGO} -salt \
+			-in "${keyfile}" -pass env:PASSVAR)"
+
+	if [[ $? -ne 0 || -z "${key}" ]]; then
+		_warn "p11_master_decrypt_key: openssl call failed while decrypting key"
+		return 1
+	fi
+
+	echo -n "${key}"
+}

@@ -1,0 +1,76 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP miscellaneous functions.
+# Copyright (C) 2010-2014 SGDSN/ANSSI
+# Author: Mickaël Salaün <clipos@ssi.gouv.fr>
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+
+escape_regexp_ext() {
+	local exp="$*"
+	exp="${exp//\\/\\\\}"
+	exp="${exp//\{/\{}"
+	exp="${exp//\}/\}}"
+	exp="${exp//[/\[}"
+	exp="${exp//]/\]}"
+	exp="${exp//\(/\(}"
+	exp="${exp//\)/\)}"
+	exp="${exp//\|/\|}"
+	exp="${exp//\*/\*}"
+	exp="${exp//\+/\+}"
+	exp="${exp//\./\.}"
+	exp="${exp//\?/\?}"
+	exp="${exp//\^/\^}"
+	exp="${exp//\$/\\\$}"
+	echo -n "${exp}"
+}
+
+_current_login() {
+	local col="${1}"
+	local ret=""
+	local user="$(last -w -1f /var/run/utmp :0.0 2>/dev/null | sed -rn '1s/^(\S+).*/\1/p')"
+	[[ -n "${user}" ]] && ret="$(grep -m 1 -e "^${user}:" /etc/passwd | cut -d: "-f${col}")"
+	echo -n "${ret}"
+}
+
+current_user() {
+	_current_login 1
+}
+
+current_uid() {
+	_current_login 3
+}
+
+current_gid() {
+	_current_login 4
+}
+
+get_user_type() {
+	local user="${1}"
+	local utype=""
+
+	local -a grps=( $(groups "${user}") )
+
+	for g in "${grps[@]}"; do
+		case "${g}" in
+			priv_user)
+				[[ -n "${utype}" ]] || utype="privuser"
+				# We need to keep looking for a possible 'nomad_user'
+				;;
+			nomad_user)
+				utype="nomad"
+				break
+				;;
+			core_admin)
+				utype="admin"
+				break
+				;;
+			core_audit)
+				utype="audit"
+				break
+				;;
+		esac
+	done
+
+	echo -n "${utype:-user}"
+}

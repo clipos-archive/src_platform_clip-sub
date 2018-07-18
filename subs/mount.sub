@@ -1,0 +1,91 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP VFS mount functions.
+# Copyright (C) 2006-2009 SGDN/DCSSI
+# Copyright (C) 2009-2010 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved.
+
+
+if [[ -n "${MOUNT_SUB_DEBUG}" ]]; then
+	set -x 
+fi
+
+mount_warn() {
+	echo "${1}" >&2
+	logger -p local0.err -t "[MNT]" "${1}"
+}
+
+mount_error() {
+	warn "${1}"
+	exit 1
+}
+
+skip_comments() {
+	sed -e 's/#.*$//' $* | \
+		grep -Ev '^[[:space:]]*$'
+}
+
+# - rev_lines <file> : prints the lines of <file> in reverse order on standard output
+rev_lines() {
+	#local _file=$1
+	#nl -bt $_file | sort -nr | cut -f2-
+	# Yeah, well, next time I'll google first ...
+	tac "${1}"
+}
+
+#namespace ignored for now...
+
+# - do_mounts <src_root> <dest_root> <fstab>
+# perform all mounts specified in fstab-like 
+# file <fstab> as bind mounts, with a common base directory <root> added to 
+# all paths.
+# Lines in <fstab> must have the following format :
+# <source> <dest> <options>
+# to mount <src_root>/<source> to <dest_root>/<dest> with options <options>
+
+do_mounts() {
+	if [[ $# -lt 3 ]]; then 
+		mount_warn "do_mounts : insufficient number of parameters : $#" 
+		return 1
+	fi
+
+	local src_root="${1}"
+	local dest_root="${2}"
+	local fstab="${3}"
+
+	skip_comments < "${fstab}" |
+		awk -v sroot="${src_root}" -v droot="${dest_root}" \
+			'{ print "mount --bind -o "$3" "sroot$1" "droot$2}'  |
+			while read _cmd; do
+				eval $_cmd || \
+					mount_warn "Failed to mount : $_cmd"
+			done
+	
+	return 0
+}
+
+# - do_umounts <dest_root> <fstab> 
+# undo mounts performed by do_mounts
+
+do_umounts() {
+	if [[ $# -lt 2 ]]; then 
+		mount_warn "do_umounts : insufficient number of parameters : $#" 
+		return 1
+	fi
+
+	local root="${1}"
+	local fstab="${2}"
+
+	rev_lines "${fstab}" | skip_comments |
+		awk -v root="${root}" '{ print "umount "root$2}'  |
+			while read _cmd; do
+				eval $_cmd || \
+					mount_warn "Failed to umount : $_cmd" 
+			done
+	
+	return 0
+}
+
+

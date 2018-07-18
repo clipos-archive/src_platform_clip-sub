@@ -1,0 +1,87 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP console prompt functions
+# Copyright (C) 2011-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved.
+
+eval $(/lib/rc/bin/eval_ecolors)
+
+PROMPT_TTYNUM="8"
+PROMPT_TTY="/dev/tty8"
+
+do_clear() {
+	# Send 'clear' escape sequence
+	echo -e '\033[H\033[J' > ${PROMPT_TTY}
+}
+
+reset_con() {
+	do_clear
+}
+
+# Prompt_user : ${var} ${msg} ${timeout} ${tries} ${config1} ${config2} ... 
+prompt_user() {
+	local var="${1}"
+	local msg="${2}"
+	local timeout="${3}"
+	local -i tries=${4}
+	local confselected=""
+	local selected=""
+	shift 4
+
+	chvt ${PROMPT_TTYNUM}
+	do_clear
+	echo "${GOOD}   ${msg}${HILITE}" > ${PROMPT_TTY}
+	
+	# No keyboard, no need to wait for user input
+	if [[ -f /usr/local/var/no_keyboard ]]; then
+		confselected="${1}"
+		eval "${var}=${confselected}"
+		echo ""
+		echo "${NORMAL}   Clavier non détecté, utilisation de la configuration par défaut" > ${PROMPT_TTY}
+		return 0;
+	fi
+
+	local num=0
+	declare -a conflist
+	for conf in "${@}"; do
+		if [[ "${conf}" == "default" ]]; then
+			printf "\t[${num}]\tConfiguration par defaut\n" > ${PROMPT_TTY}
+		else
+			printf "\t[${num}]\t${conf}\n" > ${PROMPT_TTY}
+		fi
+		conflist[${num}]="${conf}"
+		let "num+=1"
+	done
+
+	printf "${GOOD}\n   Veuillez saisir le numéro de la configuration à utiliser :\n${HILITE}\t " > ${PROMPT_TTY}
+	selected=$(timeout ${timeout} head -n 1 <${PROMPT_TTY})
+	local -i ret=$?
+	echo -n "${NORMAL}" > ${PROMPT_TTY}
+
+	if [[ $ret -ne 0 ]]; then
+		confselected="${1}"
+		echo ""
+		echo "${NORMAL}   Délai d'attente dépassé, utilisation de la configuration par défaut" > ${PROMPT_TTY}
+		sleep 1
+
+	elif expr "${selected}" + 1 2>/dev/null 1>/dev/null && [[ ${selected} -ge 0 && ${selected} -lt ${num} ]]; then
+		confselected="${conflist[${selected}]}"
+		echo "${NORMAL}   Configuration choisie: ${confselected}" > ${PROMPT_TTY}
+	else
+		echo "${BAD}   Choix non supporté: ${HILITE}${selected}${NORMAL}" > ${PROMPT_TTY}
+		sleep 2
+		if [[ ${tries} -eq 0 ]]; then
+			echo "${BAD}   Nombre maximal de saisies depasse, utilisation de la configuration par defaut" > ${PROMPT_TTY}
+			confselected="default"
+		else 
+			tries=tries-1
+			prompt_user "${var}" "${msg}" "${timeout}" "${tries}" "${@}"
+		fi
+	fi
+
+	eval "${var}=${confselected}"
+	reset_con
+	/sbin/splash "silent"
+}

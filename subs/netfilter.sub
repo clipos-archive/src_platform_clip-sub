@@ -1,0 +1,1303 @@
+# -*- sh -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# CLIP Netfilter configuration functions.
+# Copyright (C) 2006-2009 SGDN/DCSSI
+# Copyright (C) 2009-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved.
+
+if [[ -n "${NETFILTER_SUB_DEBUG}" ]]; then
+	set -x 
+fi
+
+# allow for some flexibility as this file can be changed at install time
+source "/lib/clip/netfilter_misc.sub"
+
+IPT_CMD="/sbin/iptables"
+TABLES="filter nat mangle"
+
+ALL_PORTS=":"
+TMP_PORTS="$(sed -e 's/\t/:/' /proc/sys/net/ipv4/ip_local_port_range)"
+[[ -n "${TMP_PORTS}" ]] || TMP_PORTS="1024:"
+PORT_FTP_DATA="20"
+PORT_FTP_CMD="21"
+IPSEC_MARK="1"
+
+# Match a bunch of 14 comma-separated ports, and extract them, 
+# without the final comma. Used to separate port lists into groups
+# of at most 14, which is the maximum supported by any multiport 
+# rule.
+_MULTIPORT_REGEXP='\(\([^,:]\+[,:]\)\{13,14\}[^,:]\+\),'
+
+netfilter_warn() {
+	echo "$1" > /dev/stderr
+	logger -p local0.err -t "FW: " "$1"
+}
+
+netfilter_error() {
+	netfilter_warn "$1"
+	exit 1
+}
+
+# Run an iptables command, and print an error message if it failed
+netfilter_cmd() {
+	if ! "${IPT_CMD}" "${@}"; then
+		netfilter_warn "failed command: ${IPT_CMD} $*"
+		return 1
+	fi
+}
+
+flush_all() {
+	local table
+	for table in ${TABLES}; do
+		netfilter_cmd -t "${table}" -F || return 1
+		netfilter_cmd -t "${table}" -X || return 1
+		netfilter_cmd -t "${table}" -Z || return 1
+		eval CLIP_${table}_CHAINS=""
+	done
+}
+
+# Set a default drop policy
+# Args: none
+set_policy() {
+	local -i ret=0
+	netfilter_cmd -P INPUT DROP || ret=1
+	netfilter_cmd -P OUTPUT DROP || ret=2
+	netfilter_cmd -P FORWARD DROP || ret=3
+
+	[[ $ret -eq 0 ]] || netfilter_warn "Failed to set policy ($ret)"
+	return ${ret}
+}
+
+# Create drop-log rules in a given chain
+# Args: <chain name> <log prefix> [<table>]
+_drop_log() {
+	local table="${3}"
+	[[ -n "${table}" ]] && table="-t ${table}"
+	netfilter_cmd ${table} -A "${1}" -m limit --limit "${ILLEGAL_LOGLIM}"	\
+			-j LOG --log-level "${ILLEGAL_LOGLEV}" 			\
+				--log-prefix "${2} "				\
+		|| return 1
+
+	netfilter_cmd ${table} -A "${1}" -j DROP || return 1
+}
+
+# Create reject-log rules in a given chain
+# Args: <chain name> <log prefix> [<table>]
+_reject_log() {
+	local table="${3}"
+	[[ -n "${table}" ]] && table="-t ${table}"
+	netfilter_cmd ${table} -A "${1}" -m limit --limit "${ILLEGAL_LOGLIM}"	\
+			-j LOG --log-level "${ILLEGAL_LOGLEV}" 			\
+				--log-prefix "${2} (REJECT) "			\
+		|| return 1
+	netfilter_cmd ${table} -A "${1}" -p tcp -j REJECT --reject-with tcp-reset || return 1
+	netfilter_cmd ${table} -A "${1}" -j REJECT || return 1
+}
+
+# Check if a chain has already been created
+# Args: <chain name> [<table>]
+chain_created() {
+	local chain="${1}"
+	local table="${2}"
+	[[ -n "${table}" ]] || table="filter"
+	local var="CLIP_${table}_CHAINS"
+
+	echo "${!var}" | grep -qw "${chain}"
+}
+
+# Create a user chain if it does not exist, optionnally adding
+# drop + log rules in it
+# Args: <chain name> [<table> [<droplog_p|reject> <droplogmsg>]]
+create_chain() {
+	local chain="${1}"
+	local table="${2}"
+	[[ -n "${table}" ]] || table="filter"
+
+	local var="CLIP_${table}_CHAINS"
+
+	echo "${!var}" | grep -qw "${chain}" && return 0
+
+	netfilter_cmd -t "${table}" -N "${chain}" || return 1
+
+	eval "${var}=\"\${${var}} ${chain}\""
+	if [[ -n "${3}" ]] ; then 
+		local msg="${4}"
+		if [[ -z "${msg}" ]]; then
+			netfilter_warn "missing create_chain drop log prefix"
+			return 1
+		fi
+		if [[ "${3}" == "true" ]]; then
+			_drop_log "${chain}" "${msg}" "${table}" || return 1
+		elif [[ "${3}" == "reject" ]]; then
+			_reject_log "${chain}" "${msg}" "${table}" || return 1
+		fi
+	fi
+}
+
+set_local_rules() {
+	local -i ret=0
+
+	create_chain "loopback" || return 1
+	netfilter_cmd -A OUTPUT -o lo -j loopback || ret=1
+	netfilter_cmd -A INPUT -i lo -j loopback || ret=2
+	if [[ $ret -ne 0 ]]; then
+		netfilter_warn "Failed to add loopback rule ($ret)"
+		return 1
+	fi
+	create_chain "localout" || return 1
+	netfilter_cmd -A "localout" -p icmp 			\
+			--icmp-type destination-unreachable   	\
+			-j ACCEPT 				\
+	# Allow TCP RST for reject
+	netfilter_cmd -A "localout" -p tcp 			\
+			--tcp-flags SYN,RST,ACK,FIN RST,ACK	\
+			-j ACCEPT 				\
+		|| return 1
+	_drop_log "localout" "FW: localout" || return 1
+}
+
+set_default_rules() {
+	# log invalid states
+	create_chain "invalidstate" "filter" "true" "FW: invalid state" || return 1
+
+	local -i ret=0
+	netfilter_cmd -A OUTPUT -m state --state INVALID -j invalidstate || ret=1
+	netfilter_cmd -A INPUT -m state --state INVALID -j invalidstate || ret=2
+	netfilter_cmd -A FORWARD -m state --state INVALID -j invalidstate || ret=3
+	if [[ $ret -ne 0 ]]; then
+		netfilter_warn "Failed to add invalidstate rule ($ret)"
+		return 1
+	fi
+
+	# Mark packets selected for ipsec so that they don't get SNAT'ed later
+	# on, which could change where they fit in the SPD
+	netfilter_cmd -t mangle -A POSTROUTING 				\
+			-m policy --dir out --pol ipsec			\
+			-j MARK --set-mark "${IPSEC_MARK}"		\
+		|| return 1
+}
+
+# Drop without logging, at most 15 ports
+# Args: <iface> (-i <if> or -o <if>) <chain> <proto> <ports> (comma-separated list, at most 15) 
+# <addr_match> (-s <addr> or -d <addr>)
+_drop_nolog_one() {
+	local iface="${1}"
+	local chain="${2}"
+	local proto="${3}"
+	local ports="${4}"
+	local addr="${5}"
+
+	netfilter_cmd -A "${chain}" ${iface} -p "${proto}"  ${addr}		\
+			-m multiport --dports "${ports}" -j DROP	\
+		|| return 1
+}
+
+# Drop without logging, all ports you can eat
+# Args: <way:in/out> <chain> <iface> <addr> <proto> <ports> (comma separated list or 'all' for all ports)
+drop_nolog() {
+	local way="${1}"
+	local chain="${2}"
+	local iface="${3}"
+	local addr="${4}"
+	local proto="${5}"
+	local ports="${6}"
+
+	case "${way}" in
+		in)
+			addr="-d ${addr}"
+			iface="-i ${iface}"
+			;;
+		out)
+			addr="-s ${addr}"
+			iface="-o ${iface}"
+			;;
+		*)
+			netfilter_warn "unsupported nolog way: ${way}"
+			return 0
+			;;
+	esac
+	
+
+	[[ -z "${ports}" ]] && return 0
+	[[ "${ports}" == "-" ]] && return 0
+
+	if [[ "${ports}" == "all" ]]; then
+		netfilter_cmd -A "${chain}" ${iface} -p "${proto}" ${addr} -j DROP \
+			|| return 1
+	else 
+		local list="$(echo "${ports}" | sed -e "s/${_MULTIPORT_REGEXP}/\1 /g" )"
+
+		for bunch in ${list}; do
+			_drop_nolog_one "${iface}" "${chain}" "${proto}" "${bunch}" "${addr}" \
+				|| return 1
+		done
+	fi
+}
+
+# Set final drop (with / without logging) rules
+set_final_rules() {
+	_reject_log "loopback" "FW: loopback" || return 1
+	_drop_log OUTPUT "FW: OUTPUT" || return 1
+	_drop_log FORWARD "FW: FORWARD" || return 1
+	_drop_log INPUT "FW: INPUT" || return 1
+}
+
+
+# Local loop pass for at most 15 ports
+# Args: <addr> <ports> (comma-separated list, at most 15)
+_pass_local_lo_one() {
+	local addr="${1}"
+	local ports="${2}"
+	netfilter_cmd -A loopback -s "${addr}" -d "${addr}" -p tcp 		\
+			 --sport "${TMP_PORTS}" -m multiport --dports "${ports}"\
+			 -j ACCEPT						\
+		|| return 1
+	netfilter_cmd -A loopback -s "${addr}" -d "${addr}" -p tcp 		\
+			--dport "${TMP_PORTS}" -m multiport --sports "${ports}" \
+			! --syn -j ACCEPT					\
+		|| return 1
+}
+
+# Local loop pass (stateless), with all the ports you can eat.
+# Args: <addr> <ports> (comma-separated list)
+pass_local_lo() {
+	local addr="${1}"
+	local ports="${2}"
+
+	local list="$(echo "${ports}" | sed -e "s/${_MULTIPORT_REGEXP}/\1 /g" )"
+
+	local bunch
+	for bunch in ${list}; do
+		_pass_local_lo_one "${addr}" "${bunch}" || return 1
+	done
+}
+
+# Local loop pass (forward) for at most 15 ports
+# Args: <if_in>  <if_out> <ports> (comma-separated list, at most 15)
+_pass_local_fw_one() {
+	local if_in="${1}"
+	local if_out="${2}"
+	local ports="${3}"
+	netfilter_cmd -A FORWARD -i "${if_in}" -o "${if_out}" -p tcp 		\
+			 --sport "${TMP_PORTS}" -m multiport --dports "${ports}"\
+			 -j ACCEPT						\
+		|| return 1
+	netfilter_cmd -A FORWARD -o "${if_in}" -i "${if_out}" -p tcp 		\
+			--dport "${TMP_PORTS}" -m multiport --sports "${ports}" \
+			! --syn -j ACCEPT					\
+		|| return 1
+}
+
+# Local loop pass (stateless), with all the ports you can eat.
+# Args:  <if_out> <addr> <ports> (comma-separated list)
+pass_local_fw() {
+	local if_in="${1}"
+	local if_out="${2}"
+	local ports="${3}"
+
+	local list="$(echo "${ports}" | sed -e "s/${_MULTIPORT_REGEXP}/\1 /g" )"
+
+	local bunch
+	for bunch in ${list}; do
+		_pass_local_fw_one "${if_in}" "${if_out}" "${bunch}" || return 1
+	done
+}
+
+# Allow output of destinatio-unreachable ICMP messages on a local
+# (virtual) interface, so that the core may signal a jail that network
+# is down.
+# Args: <local interface>
+pass_local_unreachable() {
+	local iface="${1}"
+
+	netfilter_cmd -A OUTPUT -o "${iface}" -j "localout" \
+		|| return 1
+}
+
+# Force ipsec (tunnel mode, with optionnal tunnel endpoints)
+# Args: <interface or '-'> <local address> [<outbound tunnel src> <outbound tunnel dsts (multiple)>]
+_force_ipsec() {
+	local itf="${1}"
+	local addr="${2}"
+	local tunsrc="${3}"
+	local tundsts="${4}"
+
+	local itfout="-o ${itf}"
+	local itfin="-i ${itf}"
+	if [[ "${itf}" == "-" ]]; then
+		itf=""
+		itfout="! -o lo"
+		itfin="! -i lo"
+	fi
+	
+	local saddr="-s ${addr}"
+	local daddr="-d ${addr}"
+
+	# -s ! <addr> is deprecated...
+	if [[ "${addr#\!}" != "${addr}" ]]; then
+		saddr="! -s ${addr#\!}"
+		daddr="! -d ${addr#\!}"
+	fi
+
+	local polout="--pol ipsec --strict --proto esp --mode tunnel"
+	local polin="--pol ipsec --strict --proto esp --mode tunnel"
+
+	if [[ -n "${tunsrc}" ]]; then
+		polout="${polout} --tunnel-src ${tunsrc}"
+		polin="${polin} --tunnel-dst ${tunsrc}"
+	fi
+	create_chain "ipsec${itf}log" "mangle" "true" "FW: expected ipsec" || return 1
+
+	netfilter_cmd -t mangle -A POSTROUTING ${itfout} ${saddr} 	\
+			-p tcp --tcp-flags SYN,RST SYN 			\
+			-j TCPMSS --clamp-mss-to-pmtu			\
+		|| return 1
+	
+	if [[ -n "${tundsts}" ]]; then
+		local tundst
+		for tundst in ${tundsts}; do
+			local _polout="${polout} --tunnel-dst ${tundst}"
+			local _polin="${polin} --tunnel-src ${tundst}"
+			netfilter_cmd -t mangle -A POSTROUTING ${itfout} ${saddr} \
+					-m policy --dir out ${_polout}		  \
+					-j ACCEPT 				  \
+				|| return 1
+
+			netfilter_cmd -t mangle -A PREROUTING ${itfin} ${daddr} \
+					-m policy --dir in ${_polin}		\
+					-j ACCEPT				\
+				|| return 1
+		done
+	else
+		netfilter_cmd -t mangle -A POSTROUTING ${itfout} ${saddr} \
+				-m policy --dir out ${polout}		  \
+				-j ACCEPT 				  \
+			|| return 1
+
+		netfilter_cmd -t mangle -A PREROUTING ${itfin} ${daddr} \
+				-m policy --dir in ${polin}		\
+				-j ACCEPT				\
+			|| return 1
+	fi
+
+	netfilter_cmd -t mangle -A POSTROUTING ${itfout} ${saddr}	\
+			-j ipsec${itf}log				\
+		|| return 1
+	
+	netfilter_cmd -t mangle -A PREROUTING ${itfin} ${daddr} 	\
+			-j ipsec${itf}log				\
+		|| return 1
+}
+
+# Force ipsec encapsulation on all packets to and from a given address
+# list on one interface
+# NB : call this before pass_compartment
+# Args: <interface> <local address> [<outbound tunnel src> <outbound tunnel dsts (multilple)>]
+force_ipsec_if() {
+	[[ -z "${2}" ]] && netfilter_error "not enough args for force_ipsec_if"
+
+	_force_ipsec "${1}" "${2}" "${3}" "${4}"
+	return $?
+}
+
+# Force ipsec encapsulation on all packets to and from a given address
+# list on all interfaces
+# NB : call this before pass_compartment
+# Args: <local address> [<outbound tunnel src> <outbound tunnel dsts (multilple)>]
+force_ipsec_all() {
+	[[ -z "${1}" ]] && netfilter_error "not enough args for force_ipsec_all"
+
+	_force_ipsec "-" "${1}" "${2}" "${3}"
+	return $?
+}
+
+# Force ipsec on forwarded flows (tunnel mode, with optionnal tunnel endpoints)
+# Args: <input interface> <output interface> (or '-') 
+#             [<outbound tunnel src> <outbound tunnel dsts (multiple)>]
+force_ipsec_forward() {
+	local in_itf="${1}"
+	local out_itf="${2}"
+	local tunsrc="${3}"
+	local tundsts="${4}"
+
+	local o_out="-o ${out_itf}"
+	local o_in="-i ${out_itf}"
+	if [[ "${out_itf}" == "-" ]]; then
+		o_out="! -o lo"
+		o_in="! -i lo"
+	fi
+
+	local polout="--pol ipsec --strict --proto esp --mode tunnel"
+	local polin="--pol ipsec --strict --proto esp --mode tunnel"
+	local logchain="ipsec-${in_itf}-${out_itf}-log"
+
+	if [[ -n "${tunsrc}" ]]; then
+		polout="${polout} --tunnel-src ${tunsrc}"
+		polin="${polin} --tunnel-dst ${tunsrc}"
+	fi
+	create_chain "${logchain}" "mangle" "true" "FW: expected ipsec" || return 1
+
+	netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+			-p tcp --tcp-flags SYN,RST SYN 			\
+			-j TCPMSS --clamp-mss-to-pmtu			\
+		|| return 1
+	
+	if [[ -n "${tundsts}" ]]; then
+		local tundst
+		for tundst in ${tundsts}; do
+			local _polout="${polout} --tunnel-dst ${tundst}"
+			local _polin="${polin} --tunnel-src ${tundst}"
+			netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+					-m policy --dir out ${_polout}		  \
+					-j ACCEPT 				  \
+				|| return 1
+
+			netfilter_cmd -t mangle -A FORWARD -o "${in_itf}" ${o_in} \
+					-m policy --dir in ${_polin}		\
+					-j ACCEPT				\
+				|| return 1
+		done
+	else
+		netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+				-m policy --dir out ${polout}		  \
+				-j ACCEPT 				  \
+			|| return 1
+
+		netfilter_cmd -t mangle -A FORWARD -o "${in_itf}" ${o_in} \
+				-m policy --dir in ${polin}		\
+				-j ACCEPT				\
+			|| return 1
+	fi
+
+	netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+			-j "${logchain}"				\
+		|| return 1
+	
+	netfilter_cmd -t mangle -A FORWARD -o "${in_itf}" ${o_in} \
+			-j "${logchain}"				\
+		|| return 1
+}
+
+# Force ipsec on forwarded flows (tunnel mode, with destination networks and
+# optional tunnel endpoints)
+# Args: <input interface> <output interface> (or '-')
+#             <destination networks>
+#             [<outbound tunnel src> <outbound tunnel dsts (multiple)>]
+# Should be merged with force_ipsec_forward() at one point
+force_ipsec_forward_dst() {
+	local in_itf="${1}"
+	local out_itf="${2}"
+	local netdsts="${3}"
+	local tunsrc="${4}"
+	local tundsts="${5}"
+
+	local o_out="-o ${out_itf}"
+	local o_in="-i ${out_itf}"
+	if [[ "${out_itf}" == "-" ]]; then
+		o_out="! -o lo"
+		o_in="! -i lo"
+	fi
+
+	local polout="--pol ipsec --strict --proto esp --mode tunnel"
+	local polin="--pol ipsec --strict --proto esp --mode tunnel"
+	local logchain="ipsec-${in_itf}-${out_itf}-log"
+
+	if [[ -n "${tunsrc}" ]]; then
+		polout="${polout} --tunnel-src ${tunsrc}"
+		polin="${polin} --tunnel-dst ${tunsrc}"
+	fi
+	create_chain "${logchain}" "mangle" "true" "FW: expected ipsec" || return 1
+
+	netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+			-p tcp --tcp-flags SYN,RST SYN 			\
+			-j TCPMSS --clamp-mss-to-pmtu			\
+		|| return 1
+
+	local netdst tundst
+	for netdst in ${netdsts}; do
+		if [[ -n "${tundsts}" ]]; then
+			for tundst in ${tundsts}; do
+				local _polout="${polout} --tunnel-dst ${tundst}"
+				local _polin="${polin} --tunnel-src ${tundst}"
+				netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+						-m policy --dir out ${_polout} --dst ${netdst}		  \
+						-j ACCEPT 				  \
+					|| return 1
+
+				netfilter_cmd -t mangle -A FORWARD -o "${in_itf}" ${o_in} \
+						-m policy --dir in ${_polin} --src ${netdst}		\
+						-j ACCEPT				\
+					|| return 1
+			done
+		else
+			netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+					-m policy --dir out ${polout} --dst ${netdst}		  \
+					-j ACCEPT 				  \
+				|| return 1
+
+			netfilter_cmd -t mangle -A FORWARD -o "${in_itf}" ${o_in} \
+					-m policy --dir in ${polin} --src ${netdst}	\
+					-j ACCEPT				\
+				|| return 1
+		fi
+
+		netfilter_cmd -t mangle -A FORWARD -i "${in_itf}" ${o_out} \
+				--dst "${netdst}" -j "${logchain}"				\
+			|| return 1
+
+		netfilter_cmd -t mangle -A FORWARD -o "${in_itf}" ${o_in} \
+				--src "${netdst}" -j "${logchain}"				\
+			|| return 1
+	done
+
+}
+
+# Pass ESP and IKE UDP to/from peer (for clients: initiator only)
+# Args: <interface> <local address> <remote addresses or '-'> 
+pass_ipsec_if() {
+	local itf="${1}"
+	local addr="${2}"
+	local remotes="${3}"
+
+	local rmtout=""
+	local rmtin=""
+	local rmt
+	for rmt in ${remotes}; do
+		if [[ "${rmt}" != "-" ]]; then
+			rmtout="-d ${rmt}"
+			rmtin="-s ${rmt}"
+		fi
+
+		netfilter_cmd -A OUTPUT -o "${itf}" -p esp -s "${addr}" ${rmtout} -j ACCEPT \
+			|| return 1
+
+		netfilter_cmd -A INPUT -i "${itf}" -p esp -d "${addr}" ${rmtin} -j ACCEPT \
+			|| return 1
+	
+		_pass_ike "${itf}" "${addr}" "500" "${rmtout}" "${rmtin}" || return 1
+		_pass_ike "${itf}" "${addr}" "4500" "${rmtout}" "${rmtin}" || return 1
+	done
+}
+
+# Perform SNAT on those packets which were not marked to be
+# encapsulated in IPSEC, from a given address
+# Args: <interface> <initial source address> <target source address>
+snat_cleartext_if() {
+	netfilter_cmd -t nat -A POSTROUTING -o "${1}"			\
+			-s "${2}" -m mark ! --mark "${IPSEC_MARK}"	\
+			-j SNAT --to-source "${3}"			\
+		|| return 1
+}
+
+# Perform SNAT on those packets which were not marked to be
+# encapsulated in IPSEC, from a given input interface
+# Args: <input interface> <output interface> <target source address> <mark>
+snat_cleartext_forward() {
+	# Mark the packets in forward, if no ipsec policy
+	netfilter_cmd -t mangle -A FORWARD -i "${1}" -o "${2}"		\
+		-m policy --dir out --pol none				\
+		-j MARK --set-mark "${4}"				\
+
+	# Clamp MSS to PMTU for RMB too
+	netfilter_cmd -t mangle -A POSTROUTING -o "${2}" 	        \
+			-m mark --mark "${4}" 				\
+			-p tcp --tcp-flags SYN,RST SYN 			\
+			-j TCPMSS --clamp-mss-to-pmtu			\
+		|| return 1
+
+	# Apply SNAT in postrouting, to marked packets
+	netfilter_cmd -t nat -A POSTROUTING -o "${2}"			\
+			-m mark --mark "${4}" 				\
+			-j SNAT --to-source "${3}"			\
+		|| return 1
+}
+
+# Bypass IPsec on those packets which were not marked to be encapsulated in
+# IPSEC, to a given interface (cf. _ipsec_force)
+# Args: <output interface> <mark>
+bypass_ipsec() {
+	# Accept identified packets in postrouting
+	netfilter_cmd -t mangle -A POSTROUTING -o "${1}"		\
+		-m policy --dir out --pol none				\
+		-m mark --mark "${2}" -j ACCEPT
+}
+
+# Perform DNAT on incoming packets
+# Args: <interface> <proto> <initial destination address> <target destination address> <dports> 
+dnat_if() {
+	local itf="${1}"
+	local proto="${2}"
+	local odest="${3}"
+	local ndest="${4}"
+	local ports="${5}"
+
+	netfilter_cmd -t nat -A PREROUTING -i "${itf}" 			\
+			-d "${odest}" -p "${proto}" --dport "${ports}"	\
+			-j DNAT --to-destination "${ndest}"		\
+		|| return 1
+}
+
+# Create stateless chains for each state in a net context.
+# Args:  <in|out|inout> <chain basename>
+_init_stateless_chains() {
+	local way="${1}"
+	local base="${2}"
+	local do_in=""
+	local do_out=""
+	case "${way}" in 
+		in)
+			do_in="y"
+			;;
+		out)
+			do_out="y"
+			;;
+		inout)
+			do_in="y"
+			do_out="y"
+			;;
+		*)
+			netfilter_error "Unrecognized option: ${way}. Only in|out|inout are allowed"
+			;;
+	esac
+	create_chain "${base}outest" || return 1
+	create_chain "${base}inest" || return 1
+	if [ -n "${do_out}" ]; then
+		create_chain "${base}outnew" || return 1
+		# Related input chain for ICMP (errors)
+		create_chain "${base}inrel" || return 1
+	fi
+	if [ -n "${do_in}" ]; then 
+		create_chain "${base}innew" || return 1
+		# Related output chain for ICMP (errors)
+		create_chain "${base}outrel" || return 1
+	fi
+}
+
+# Setup 'pass all' rules in a group of stateless chains
+# Args: <chain basename>
+_pass_all_stateless_chains() {
+	local base="${1}"
+	for suf in {in,out}{new,ret,est}; do
+		if chain_created "${base}${suf}"; then
+			netfilter_cmd -A "${base}${suf}" \
+					-j ACCEPT \
+				|| return 1
+		fi
+
+	done
+}
+
+# Finish setting up stateless chains by adding a default drop log at their ends
+# Note : all unauthorized outbound packets are rejected (i.e. with notification
+# to the sender), while unauthorized inbound packets are silently dropped.
+# Args: <chain basename>
+_finish_stateless_chains() {
+	local base="${1}"
+	for suf in "new" "rel" "est"; do
+		# Reject outbound
+		if chain_created "${base}out${suf}"; then
+			_reject_log "${base}out${suf}" "FW: ${base}out${suf}" \
+				|| return 1
+		fi
+		# Drop inbound
+		if chain_created "${base}in${suf}"; then
+			_drop_log "${base}in${suf}" "FW: ${base}in${suf}" \
+				|| return 1
+		fi
+	done
+}
+
+# Creates stateless rules for an allowed [in,out]bound connection: 
+# - outbound: OUPUT new, OUTPUT established, and INPUT established
+# - inbound: INPUT new, INPUT established, and OUTPUT established
+# The stateless chains must have been created beforehand.
+# This works for at most 15 comma-separated ports.
+
+# Args <in|out> <chain basename> <proto> <sport> <dport>
+_pass_one() {
+	local way="$1"
+	local antiway="any"
+	case "${way}" in
+		in) 
+			antiway="out"
+			;;
+		out)
+			antiway="in"
+			;;
+	esac
+
+	local base="${2}"
+	local proto="${3}"
+	local sport="${4}"
+	local dport="${5}"
+
+	local dport_match="--dport"
+	local sport_match="--sport"
+	if [[ "${dport/,/}" != "${dport}" ]]; then 
+		dport_match="-m multiport --dports"
+		sport_match="-m multiport --sports"
+	fi
+
+	netfilter_cmd -A "${base}${way}new" -p "${proto}" 		\
+			--sport "${sport}" ${dport_match} "${dport}" 	\
+			-j ACCEPT					\
+		|| return 1
+	
+	netfilter_cmd -A "${base}${way}est" -p "${proto}" 	 	\
+			--sport "${sport}" ${dport_match} "${dport}" 	\
+			-j ACCEPT					\
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}est" -p "${proto}"		\
+			--dport "${sport}" ${sport_match} "${dport}" 	\
+			-j ACCEPT					\
+		|| return 1
+}
+
+# Creates stateless rules for an allowed [in,out]bound connection: 
+# - outbound: OUPUT new, OUTPUT established, and INPUT established
+# - inbound: INPUT new, INPUT established, and OUTPUT established
+# The stateless chains must have been created beforehand.
+# This works for as many ports as you can eat...
+
+# Args <in|out> <chain basename> <proto> <sport> <dport>
+_pass() {
+	local way="${1}"
+	local base="${2}"
+	local proto="${3}"
+	local sport="${4}"
+	local dport="${5}"
+
+	local sport_list="$(echo "${sport}" | sed -e "s/${_MULTIPORT_REGEXP}/\1 /g")"
+	local dport_list="$(echo "${dport}" | sed -e "s/${_MULTIPORT_REGEXP}/\1 /g")"
+
+	local _sport _dport
+	for _sport in ${sport_list}; do
+	for _dport in ${dport_list}; do
+		_pass_one "${way}" "${base}" "${proto}" "${_sport}" "${_dport}" \
+			|| return 1
+	done
+	done
+}
+
+# Create stateless rules for an allowed outbound connection : OUPUT
+# new, OUTPUT established, and INPUT established. The stateless chains
+# must have been created beforehand.
+
+# Args <chain basename> <proto> <sport> <dport>
+_pass_out() {
+	_pass "out" "$1" "$2" "$3" "$4"	|| return 1
+}
+
+# Create stateless rules for an allowed inbound connection : INPUT
+# new, INPUT established, and OUTPUT established. The stateless chains
+# must have been created beforehand.
+
+# Args <chain basename> <proto> <sport> <dport>
+_pass_in() {
+	_pass "in" "$1" "$2" "$3" "$4" || return 1
+}
+
+# Establish multiple pass rules with the same source and destination ports,
+# from a given comma-separated list of ports
+
+# Args <dir> <chain basename> <proto> <ports>
+_pass_same() {
+	local dir="$1"
+	local base="$2"
+	local proto="$3"
+	local ports="$4"
+
+	ports="${ports//,/ }" 
+	local port
+	for port in $ports; do
+		_pass "${dir}" "${base}" "${proto}" "${port}" "${port}" \
+			|| return 1
+	done
+}
+
+# Establish multiple pass rules with a specific source and destination
+# from a given comma-separated list of port couples
+
+# Args <dir> <chain basename> <proto> <ports>
+_pass_srcdst() {
+	local dir="$1"
+	local base="$2"
+	local proto="$3"
+	local ports="$4"
+
+	ports="${ports//,/ }" 
+	local port
+	for port in $ports; do
+		local srcport="${port%-*}"
+		local dstport="${port#*-}"
+		if [[ -z "${srcport}" || -z "${dstport}" ]]; then
+			netfilter_error "_pass_srcdst: unsupported port couple : ${port}"
+		fi
+		_pass "${dir}" "${base}" "${proto}" "${srcport}" "${dstport}" \
+			|| return 1
+	done
+}
+
+# Allow icmp error messages for a given set of chains. Note that the
+# direction argument is inverted, i.e. pass_icmp "out" "foobar" will create
+# rules allowing icmp error messages *in*, when those messages are sent
+# in answer to an outbound connection from foobar.
+# Args: <direction> <chains basename>
+pass_icmp() {
+	local way="$1"
+	local base="${2}"
+	local antiway
+	case "${way}" in
+		inout)
+			pass_icmp "in" "${base}" || return 1
+			pass_icmp "out" "${base}" || return 1
+			return 0
+			;;
+		in)
+			antiway="out"
+			;;
+		out)
+			antiway="in"
+			;;
+		*)
+			netfilter_warn "Unsupported icmp way: ${way}"
+			return 1
+			;;
+	esac
+
+	netfilter_cmd -A "${base}${antiway}est" 		\
+			-p icmp					\
+			--icmp-type destination-unreachable 	\
+			-j ACCEPT				\
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}est" 		\
+			-p icmp					\
+			--icmp-type time-exceeded		\
+			-j ACCEPT				\
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}rel" 		\
+			-p icmp					\
+			--icmp-type destination-unreachable 	\
+			-j ACCEPT				\
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}rel" 		\
+			-p icmp					\
+			--icmp-type time-exceeded		\
+			-j ACCEPT				\
+		|| return 1
+}
+
+# Allow icmp ping messages for a given set of chains, and the matching
+# pongs. 
+# Args: <direction> <chains basename>
+pass_ping() {
+	local way="$1"
+	local base="${2}"
+	local antiway
+	case "${way}" in
+		inout)
+			pass_ping "in" "${base}" || return 1
+			pass_ping "out" "${base}" || return 1
+			return 0
+			;;
+		in)
+			antiway="out"
+			;;
+		out)
+			antiway="in"
+			;;
+		*)
+			netfilter_warn "Unsupported ping way: ${way}"
+			return 1
+			;;
+	esac
+
+	netfilter_cmd -A "${base}${way}new"			\
+			-p icmp					\
+			--icmp-type echo-request		\
+			-j ACCEPT				\
+		|| return 1
+	netfilter_cmd -A "${base}${way}est" 			\
+			-p icmp					\
+			--icmp-type echo-request		\
+			-j ACCEPT				\
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}est" 		\
+			-p icmp					\
+			--icmp-type echo-reply			\
+			-j ACCEPT				\
+		|| return 1
+}
+
+# Setup the PASS_ARGS associative array for use by create_stateless_chains
+# for inbound variables
+# Args: <variable basename>
+# Ex.: setup_pass_args_in UPDATE will setup PASS_ARGS[out_tcp] as ${UPDATE_OUT_TCP}
+# if that is non-empty, and so forth
+setup_pass_args_in() {
+	local -A args=( 
+		["in_tcp"]="IN_TCP" 
+		["in_udp"]="IN_UDP"
+		["in_tcpsame"]="IN_SAME_TCP"
+		["in_udpsame"]="IN_SAME_UDP"
+	)
+
+	local base="${1}"
+	local var val
+	for key in ${!args[@]}; do
+		var="${base}_${args[$key]}"
+		val="${!var}"
+		[[ -n "${val}" ]] && PASS_ARGS[$key]="${val}"
+	done
+}
+		
+# Setup the PASS_ARGS associative array for use by create_stateless_chains
+# for outbound variables
+# Args: <variable basename>
+setup_pass_args_out() {
+	local -A args=( 
+		["out_tcp"]="OUT_TCP" 
+		["out_udp"]="OUT_UDP"
+		["out_tcpsame"]="OUT_SAME_TCP"
+		["out_udpsame"]="OUT_SAME_UDP"
+	)
+	local base="${1}"
+	local var val
+	for key in ${!args[@]}; do
+		var="${base}_${args[$key]}"
+		val="${!var}"
+		[[ -n "${val}" ]] && PASS_ARGS[$key]="${val}"
+	done
+}
+		
+# Setup a bunch of stateless rules in custom chains, to be jumped to using
+# plug_stateless_chains(). Several chains are created to match different
+# states : NEW / ESTABLISHED, and directions.
+#
+# Args: <in|out|inout> <chains basename> 
+# Actual port definitions are passed through an associative array named
+# PASS_ARGS
+create_stateless_chains() {
+	local way="${1}"
+	local base="${2}"
+
+	# Set up stateless chains
+	_init_stateless_chains "${way}" "${base}" || return 1
+	for keyword in ${!PASS_ARGS[@]}; do
+		local value="${PASS_ARGS[$keyword]}"
+		[[ -z "${value}" ]] && continue
+		# Compatibility with older networking config files
+		[[ "${value}" == "-" ]] && continue
+		case "${keyword}" in
+			out_tcp)
+			  _pass_out "${base}" "tcp" "${TMP_PORTS}" "${value}" \
+			  	|| return 1
+			  ;;
+			out_tcpsame)
+			  _pass_same "out" "${base}" "tcp" "${value}" \
+			  	|| return 1
+			  ;;
+			out_udp)
+			  _pass_out "${base}" "udp" "${TMP_PORTS}" "${value}" \
+			  	|| return 1
+			  ;;
+			out_udpsame)
+			  _pass_same "out" "${base}" "udp" "${value}" \
+			  	|| return 1
+			  ;;
+			out_ftp)
+			  pass_ftp "out" "${base}" || return 1
+			  ;;
+			out_ping)
+			  pass_ping "out" "${base}" || return 1
+			  ;;
+			out_dhcp)
+			  _pass_srcdst "out" "${base}" "udp" "68-67" \
+				|| return 1
+			  ;;
+			in_tcp)
+			  _pass_in "${base}" "tcp" "${ALL_PORTS}" "${value}" \
+			  	|| return 1
+			  ;;
+			in_tcpsame)
+			  _pass_same "in" "${base}" "tcp" "${value}" \
+			  	|| return 1
+			  ;;
+			in_udp)
+			  _pass_in "${base}" "udp" "${ALL_PORTS}" "${value}" \
+			  	|| return 1
+			  ;;
+			in_udpsame)
+			  _pass_same "in" "${base}" "udp" "${value}" \
+			  	|| return 1
+			  ;;
+			in_ftp)
+			  pass_ftp "in" "${base}" || return 1
+			  ;;
+			in_ping)
+			  pass_ping "in" "${base}" || return 1
+			  ;;
+			out_tcpdst)
+			  _pass_srcdst "out" "${base}" "tcp" "${value}" \
+			  	|| return 1
+			  ;;
+			out_udpdst)
+			  _pass_srcdst "out" "${base}" "udp" "${value}" \
+			  	|| return 1
+			  ;;
+			in_tcpsrc)
+			  _pass_srcdst "in" "${base}" "tcp" "${value}" \
+			  	|| return 1
+			  ;;
+			in_udpsrc)
+			  _pass_srcdst "in" "${base}" "udp" "${value}" \
+			  	|| return 1
+			  ;;
+			*)
+			  netfilter_error "Unrecognized argument keyword: $keyword"
+			  ;;
+		esac
+	done
+
+	return 0
+}
+
+# Setup rules to jump to the custom chains created with create_stateless_chains()
+# from the FORWARD / OUTPUT / INPUT chains, based on interfaces, state, direction and 
+# addresses.
+#
+# Args: plug_stateless_chains() <in_interface> <out_interface> 
+# <custom chains basename> <direction: in|out|inout|forward>
+# <local address / source address for FORWARD> 
+# <remote address / destination address for forward>
+plug_stateless_chains() {
+	local in_iface="${1}"
+	local out_iface="${2}"
+	local base="${3}"
+	local directions="${4}"
+	local src="${5}"
+	local dst="${6}"
+
+	local outaddr=""
+	local inaddr=""
+	if [[ "${src}" != "-" ]]; then
+		outaddr="-s ${src}"
+		inaddr="-d ${src}"
+	fi
+	if [[ -n "${dst}" ]]; then
+		if [[ "${dst}" != "-" ]]; then
+			outaddr="${outaddr} -d ${dst}"
+			inaddr="${inaddr} -s ${dst}"
+		fi
+	fi
+
+	local outargs inargs 
+	if [[ "${directions}" == "forward" ]]; then 
+		outargs="-A FORWARD -i ${in_iface} -o ${out_iface} ${outaddr}"
+		inargs="-A FORWARD -i ${out_iface} -o ${in_iface} ${inaddr}"
+	else
+		outargs="-A OUTPUT -o ${out_iface} ${outaddr}"
+		inargs="-A INPUT -i ${in_iface} ${inaddr}"
+	fi
+
+	if chain_created "${base}outnew"; then
+		netfilter_cmd ${outargs} 	 				\
+					-m state --state NEW -j "${base}outnew" \
+			|| return 1
+	fi
+	if chain_created "${base}outest"; then
+		netfilter_cmd ${outargs} 	 				\
+				-m state --state ESTABLISHED -j "${base}outest" \
+			|| return 1
+	fi
+	if chain_created "${base}outrel"; then
+		netfilter_cmd ${outargs} 					\
+				-m state --state RELATED -j "${base}outrel" 	\
+			|| return 1
+	fi
+	if chain_created "${base}innew"; then
+		netfilter_cmd ${inargs} 	 				\
+				-m state --state NEW -j "${base}innew" 		\
+			|| return 1
+	fi
+	if chain_created "${base}inest"; then
+		netfilter_cmd ${inargs} 	 				\
+				-m state --state ESTABLISHED -j "${base}inest"	\
+			|| return 1
+	fi
+	if chain_created "${base}inrel"; then
+		netfilter_cmd ${inargs} 	 				\
+				-m state --state RELATED -j "${base}inrel" 	\
+			|| return 1
+	fi
+	
+	return 0
+}
+
+# Setup all chains and rules for a compartment (network context,
+# identified by its address), including stateful checks and the
+# stateless chains they jump to on a specific interface.
+
+# Args: <in_interface> <out_interface> <chains basename> 
+#    <in|out|inout|(forward:in|out|inout)> 
+#    <context/src addr> <remote/dst addr> 
+#    [arg1 [arg2] ... [argn] ... ]] 
+# with argx in the form keyword=value.
+pass_compartment() {
+	local in_iface="${1}"
+	local out_iface="${2}"
+	local base="${3}"
+	local dir_create="${4##*:}"
+	local dir_plug="${4%%:*}"
+	local src="${5}"
+	local dst="${6}"
+
+	create_stateless_chains "${dir_create}" "${base}" \
+		|| return 1
+
+	pass_icmp  "${dir_create}" "${base}" || return 1
+
+	_finish_stateless_chains "${base}" || return 1
+
+	plug_stateless_chains "${in_iface}" "${out_iface}"	\
+				"${base}" "${dir_plug}" 	\
+				"${src}" "${dst}" 		\
+		|| return 1
+}
+
+# Setup the stateless chains for a compartment, without completing those chains with drop log statements,
+# nor plugging the chains into the netfilter control points.
+# The stateless chains thus created must then be completed and plugged with pass_compartment_end().
+# Args: <in|out|inout> <chains basename> 
+# [arg1 [arg2] ... [argn] ... ]] with argx in the form keyword=value.
+pass_compartment_start() {
+	local way="${1}"
+	local base="${2}"
+
+	create_stateless_chains "${way}" "${base}" \
+		|| return 1
+	pass_icmp  "${way}" "${base}" || return 1
+}
+
+# Complete all stateless chains for a compartment with default drop log statements, and plug those chains
+# into the netfilter control points. Used in conjunction with pass_compartment_start().
+# Args: <in_interface> <out_interface> <chains basename> <in|out|inout|forward> 
+# <src/context addr> <dst/remote addr>
+pass_compartment_end() {
+	local in_iface="${1}"
+	local out_iface="${2}"
+	local base="${3}"
+	local directions="${4}"
+	local src="${5}"
+	local dst="${6}"
+
+	_finish_stateless_chains "${base}" || return 1
+
+	plug_stateless_chains "${in_iface}" "${out_iface}" 		\
+			"${base}" "${directions}" "${src}" "${dst}" 	\
+		|| return 1
+}
+
+# Create stateless chains (including those for RELATED packets) for FTP connexions from a compartment, 
+# and populate those chains with the appropriate rules.
+# Standard stateless chains should be created with pass_compartment_start() before pass_ftp().
+# The stateless chains need to be completed and plugged with pass_compartment_end().
+# Args: <in|out|inout> <chains basename>
+pass_ftp() {
+	local way="$1"
+	local base="${2}"
+	local antiway
+	case "${way}" in
+		inout)
+			pass_ftp "in" "${base}" || return 1
+			pass_ftp "out" "${base}" || return 1
+			return 0
+			;;
+		in)
+			antiway="out"
+			;;
+		out)
+			antiway="in"
+			;;
+		*)
+			netfilter_warn "Unsupported ftp way: ${way}"
+			return 1
+			;;
+	esac
+
+	create_chain "${base}${way}new" || return 1
+	create_chain "${base}${way}est" || return 1
+	create_chain "${base}${way}rel" || return 1
+	create_chain "${base}${antiway}est" || return 1
+	create_chain "${base}${antiway}rel" || return 1
+
+	# Command session
+	netfilter_cmd -A "${base}${way}new" -p tcp \
+		--sport "${TMP_PORTS}" --dport "${PORT_FTP_CMD}" -j ACCEPT \
+		|| return 1
+
+	netfilter_cmd -A "${base}${way}est" -p tcp \
+		--sport "${TMP_PORTS}" --dport "${PORT_FTP_CMD}" -j ACCEPT \
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}est" -p tcp \
+		--dport "${TMP_PORTS}" --sport "${PORT_FTP_CMD}" -j ACCEPT \
+		|| return 1
+
+	# Data session (active)
+	netfilter_cmd -A "${base}${antiway}rel" -p tcp \
+		--dport "${TMP_PORTS}" --sport "${PORT_FTP_DATA}" -j ACCEPT \
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}est" -p tcp \
+		--dport "${TMP_PORTS}" --sport "${PORT_FTP_DATA}" -j ACCEPT \
+		|| return 1
+
+	netfilter_cmd -A "${base}${way}est" -p tcp \
+		--sport "${TMP_PORTS}" --dport "${PORT_FTP_DATA}" -j ACCEPT \
+		|| return 1
+
+	# Data session (passive)
+	netfilter_cmd -A "${base}${way}rel" -p tcp \
+		--sport "${TMP_PORTS}" --dport "${ALL_PORTS}" -j ACCEPT \
+		|| return 1
+
+	netfilter_cmd -A "${base}${way}est" -p tcp \
+		--sport "${TMP_PORTS}" --dport "${ALL_PORTS}" -j ACCEPT \
+		|| return 1
+
+	netfilter_cmd -A "${base}${antiway}est" -p tcp \
+		--sport "${ALL_PORTS}" --dport "${TMP_PORTS}" -j ACCEPT \
+		|| return 1
+}
+
+print_status() {
+	echo "###############################################"
+	echo "#                  FILTER                     #"
+	echo "###############################################"
+	echo
+	"${IPT_CMD}" --line-numbers -nvL
+
+	echo
+	echo
+	echo "###############################################"
+	echo "#                  NAT                        #"
+	echo "###############################################"
+	echo
+	"${IPT_CMD}" -t nat --line-numbers -nvL
+
+	echo
+	echo
+	echo "###############################################"
+	echo "#                  MANGLE                     #"
+	echo "###############################################"
+	echo
+	"${IPT_CMD}" -t mangle --line-numbers -nvL
+}
